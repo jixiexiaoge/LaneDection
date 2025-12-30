@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>车道线识别系统</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1a1a1a;
+            color: #ffffff;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        h1 { color: #00ff00; }
+        .container {
+            display: flex;
+            gap: 20px;
+            max-width: 1200px;
+            width: 100%;
+        }
+        .video-section {
+            flex: 2;
+            background: #000;
+            border: 2px solid #333;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .video-section img {
+            width: 100%;
+            display: block;
+        }
+        .data-section {
+            flex: 1;
+            background: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #444;
+        }
+        .data-item {
+            margin-bottom: 20px;
+            padding: 10px;
+            background: #3d3d3d;
+            border-radius: 4px;
+        }
+        .label {
+            font-size: 0.9em;
+            color: #aaa;
+            margin-bottom: 5px;
+        }
+        .value {
+            font-size: 1.4em;
+            font-weight: bold;
+            color: #00ff00;
+        }
+        .status-solid { color: #00ff00; }
+        .status-dashed { color: #ffff00; }
+    </style>
+</head>
+<body>
+    <h1>车道线识别实时监控</h1>
+    <div class="container">
+        <div class="video-section">
+            <img src="/video_feed" alt="视频流">
+        </div>
+        <div class="data-section">
+            <div class="data-item">
+                <div class="label">左侧车道线类型</div>
+                <div id="left_type" class="value">等待中...</div>
+            </div>
+            <div class="data-item">
+                <div class="label">右侧车道线类型</div>
+                <div id="right_type" class="value">等待中...</div>
+            </div>
+            <div class="data-item">
+                <div class="label">曲率半径 (m)</div>
+                <div id="curvature" class="value">0.00</div>
+            </div>
+            <div class="data-item">
+                <div class="label">车辆偏离中心 (m)</div>
+                <div id="departure" class="value">0.00</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function updateData() {
+            fetch('/metadata')
+                .then(response => response.json())
+                .then(data => {
+                    const leftEl = document.getElementById('left_type');
+                    const rightEl = document.getElementById('right_type');
+                    
+                    leftEl.innerText = data.left_type === 'Solid' ? '实线 (Solid)' : '虚线 (Dashed)';
+                    leftEl.className = 'value ' + (data.left_type === 'Solid' ? 'status-solid' : 'status-dashed');
+                    
+                    rightEl.innerText = data.right_type === 'Solid' ? '实线 (Solid)' : '虚线 (Dashed)';
+                    rightEl.className = 'value ' + (data.right_type === 'Solid' ? 'status-solid' : 'status-dashed');
+                    
+                    document.getElementById('curvature').innerText = data.curvature.toFixed(2);
+                    document.getElementById('departure').innerText = data.departure.toFixed(2);
+                })
+                .catch(err => console.error('获取数据失败:', err));
+        }
+        // 每 100ms 更新一次数据
+        setInterval(updateData, 100);
+    </script>
+</body>
+</html>

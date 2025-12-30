@@ -2,7 +2,19 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import glob
-from moviepy.editor import VideoFileClip
+from flask import Flask, render_template, Response, jsonify
+import threading
+import time
+
+app = Flask(__name__)
+
+# 全局变量存储最新识别数据
+latest_metadata = {
+    'left_type': 'Unknown',
+    'right_type': 'Unknown',
+    'curvature': 0.0,
+    'departure': 0.0
+}
 
 "参数设置"
 nx = 9
@@ -143,6 +155,10 @@ def cal_line_param(binary_warped):
     # 用来记录搜索窗口中非零点在nonzeroy和nonzerox中的索引
     left_lane_inds = []
     right_lane_inds = []
+    
+    # 记录有效窗口数量，用于区分实线和虚线
+    left_active_windows = 0
+    right_active_windows = 0
 
     # 遍历该副图像中的每一个窗口
     for window in range(nwindows):
@@ -167,8 +183,10 @@ def cal_line_param(binary_warped):
         # 如果获取的点的个数大于最小个数，则利用其更新滑动窗口在x轴的位置
         if len(good_left_inds) > minpix:
             leftx_current = int(np.mean(nonzerox[good_left_inds]))
+            left_active_windows += 1
         if len(good_right_inds) > minpix:
             rightx_current = int(np.mean(nonzerox[good_right_inds]))
+            right_active_windows += 1
 
     # 将检测出的左右车道点转换为array
     left_lane_inds = np.concatenate(left_lane_inds)
@@ -183,7 +201,12 @@ def cal_line_param(binary_warped):
     # 3.用曲线拟合检测出的点,二次多项式拟合，返回的结果是系数
     left_fit = np.polyfit(lefty, leftx, 2)
     right_fit = np.polyfit(righty, rightx, 2)
-    return left_fit, right_fit
+    
+    # 识别实线和虚线：如果有效窗口比例较高则认为是实线，否则为虚线
+    left_type = "Solid" if left_active_windows > 7 else "Dashed"
+    right_type = "Solid" if right_active_windows > 7 else "Dashed"
+    
+    return left_fit, right_fit, left_type, right_type
 
 # 填充车道线之间的多边形
 def fill_lane_poly(img, left_fit, right_fit):
@@ -201,139 +224,141 @@ def fill_lane_poly(img, left_fit, right_fit):
     return out_img
 
 # 计算车道线曲率
-def cal_radius(img,left_fit,right_fit):
+def cal_radius(img, left_fit, right_fit):
     # 比例
     ym_per_pix = 30/720
     xm_per_pix = 3.7/700
+    y_max = img.shape[0]
     # 得到车道线上的每个点
-    left_y_axis = np.linspace(0,img.shape[0],img.shape[0]-1)
-    left_x_axis = left_fit[0]*left_y_axis**2+left_fit[1]*left_y_axis+left_fit[0]
-    right_y_axis = np.linspace(0,img.shape[0],img.shape[0]-1)
-    right_x_axis = right_fit[0]*right_y_axis**2+right_fit[1]*right_y_axis+right_fit[2]
+    ploty = np.linspace(0, y_max-1, y_max)
+    left_x = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
+    right_x = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
 
     # 把曲线中的点映射真实世界，在计算曲率
-    left_fit_cr = np.polyfit(left_y_axis*ym_per_pix,left_x_axis*xm_per_pix,2)
-    right_fit_cr = np.polyfit(right_y_axis*ym_per_pix,right_x_axis*xm_per_pix,2)
+    left_fit_cr = np.polyfit(ploty*ym_per_pix, left_x*xm_per_pix, 2)
+    right_fit_cr = np.polyfit(ploty*ym_per_pix, right_x*xm_per_pix, 2)
 
-    # 计算曲率
-    left_curverad = ((1+(2*left_fit_cr[0]*left_y_axis*ym_per_pix+left_fit_cr[1])**2)**1.5)/np.absolute(2*left_fit_cr[0])
-    right_curverad = ((1+(2*right_fit_cr[0]*right_y_axis*ym_per_pix *right_fit_cr[1])**2)**1.5)/np.absolute((2*right_fit_cr[0]))
+    # 计算曲率 (在图像底部计算)
+    y_eval = np.max(ploty)
+    left_curverad = ((1 + (2*left_fit_cr[0]*y_eval*ym_per_pix + left_fit_cr[1])**2)**1.5) / np.absolute(2*left_fit_cr[0])
+    right_curverad = ((1 + (2*right_fit_cr[0]*y_eval*ym_per_pix + right_fit_cr[1])**2)**1.5) / np.absolute(2*right_fit_cr[0])
+    
+    avg_radius = (left_curverad + right_curverad) / 2
 
     # 将曲率半径渲染在图像上
-    cv2.putText(img,'Radius of Curvature = {}(m)'.format(np.mean(left_curverad)),(20,50),cv2.FONT_ITALIC,1,(255,255,255),5)
-    return img
+    cv2.putText(img, 'Radius of Curvature = {:.2f}(m)'.format(avg_radius), (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    return img, avg_radius
 
 # 计算车道线中心
 def cal_line_center(img):
-    undistort_img = img_undistort(img,mtx,dist)
+    undistort_img = img_undistort(img, mtx, dist)
     rigin_pipeline_img = pipeline(undistort_img)
-    trasform_img = img_perspect_transform(rigin_pipeline_img,M)
-    left_fit,right_fit = cal_line_param(trasform_img)
+    trasform_img = img_perspect_transform(rigin_pipeline_img, M)
+    left_fit, right_fit, _, _ = cal_line_param(trasform_img)
     y_max = img.shape[0]
-    left_x = left_fit[0]*y_max**2+left_fit[1]*y_max+left_fit[2]
-    right_x = right_fit[0]*y_max**2+right_fit[1]*y_max+right_fit[2]
-    return (left_x+right_x)/2
+    left_x = left_fit[0]*y_max**2 + left_fit[1]*y_max + left_fit[2]
+    right_x = right_fit[0]*y_max**2 + right_fit[1]*y_max + right_fit[2]
+    return (left_x + right_x) / 2
 
-def cal_center_departure(img,left_fit,right_fit):
+def cal_center_departure(img, left_fit, right_fit, left_type, right_type):
     # 计算中心点
     y_max = img.shape[0]
-    left_x = left_fit[0]*y_max**2 + left_fit[1]*y_max +left_fit[2]
-    right_x = right_fit[0]*y_max**2 +right_fit[1]*y_max +right_fit[2]
+    left_x = left_fit[0]*y_max**2 + left_fit[1]*y_max + left_fit[2]
+    right_x = right_fit[0]*y_max**2 + right_fit[1]*y_max + right_fit[2]
     xm_per_pix = 3.7/700
-    center_depart = ((left_x+right_x)/2-lane_center)*xm_per_pix
-    # 渲染
-    if center_depart>0:
-        cv2.putText(img,'Vehicle is {}m right of center'.format(center_depart), (20, 100), cv2.FONT_ITALIC, 1,
-                    (255, 255, 255), 5)
-    elif center_depart<0:
-        cv2.putText(img, 'Vehicle is {}m left of center'.format(-center_depart), (20, 100), cv2.FONT_ITALIC, 1,
-                    (255, 255, 255), 5)
+    
+    # 使用图像中心作为车辆中心 (假设相机安装在中心)
+    car_center = img.shape[1] / 2
+    lane_center_current = (left_x + right_x) / 2
+    center_depart = (lane_center_current - car_center) * xm_per_pix
+    
+    # 渲染偏离距离
+    if center_depart > 0:
+        text = 'Vehicle is {:.2f}m right of center'.format(center_depart)
+    elif center_depart < 0:
+        text = 'Vehicle is {:.2f}m left of center'.format(-center_depart)
     else:
-        cv2.putText(img, 'Vehicle is in the center', (20, 100), cv2.FONT_ITALIC, 1, (255, 255, 255), 5)
-    return img
+        text = 'Vehicle is in the center'
+    cv2.putText(img, text, (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    # 渲染车道线类型
+    cv2.putText(img, f'Left Line: {left_type}', (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    cv2.putText(img, f'Right Line: {right_type}', (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    return img, center_depart
 
 
-
-if __name__ == "__main__":
-    ret, mtx, dist, rvecs, tvecs = cal_calibrate_params(file_paths)
-    # if np.all(mtx != None):
-    #     img = cv2.imread("./test/test1.jpg")
-    #     undistort_img = img_undistort(img, mtx, dist)
-    #     plot_contrast_image(img, undistort_img)
-    #     print("done")
-    # else:
-    #     print("failed")
-
-    # 测试车道线提取
-    # img = cv2.imread('./test/frame45.jpg')
-    # result = pipeline(img)
-    # plot_contrast_image(img, result, converted_img_gray=True)
-
-    # 测试透视变换
-    img = cv2.imread('./test/straight_lines2.jpg')
-    points = [[601, 448], [683, 448], [230, 717], [1097, 717]]
-    img = cv2.line(img, (601, 448), (683, 448), (0, 0, 255), 3)
-    img = cv2.line(img, (683, 448), (1097, 717), (0, 0, 255), 3)
-    img = cv2.line(img, (1097, 717), (230, 717), (0, 0, 255), 3)
-    img = cv2.line(img, (230, 717), (601, 448), (0, 0, 255), 3)
-    # plt.figure()
-    # plt.imshow(img[:, :, ::-1])
-    # plt.title("原图")
-    # plt.show()
-    M, M_inverse = cal_perspective_params(img, points)
-    # if np.all(M != None):
-    #     trasform_img = img_perspect_transform(img, M)
-    #     plt.figure()
-    #     plt.imshow(trasform_img[:, :, ::-1])
-    #     plt.title("俯视图")
-    #     plt.show()
-    # else:
-    #     print("failed")
-
-    img = cv2.imread('./test/straight_lines2.jpg')
-    # undistort_img = img_undistort(img,mtx,dist)
-    # pipeline_img = pipeline(undistort_img)
-    # trasform_img = img_perspect_transform(pipeline_img,M)
-    # left_fit,right_fit = cal_line_param(trasform_img)
-    # result = fill_lane_poly(trasform_img,left_fit,right_fit)
-    # plt.figure()
-    # plt.imshow(result[:,:,::-1])
-    # plt.title("俯视图：填充结果")
-    # plt.show()
-    # trasform_img_inv = img_perspect_transform(result,M_inverse)
-    # plt.figure()
-    # plt.imshow(trasform_img_inv[:, :, ::-1])
-    # plt.title("填充结果")
-    # plt.show()
-    # res = cv2.addWeighted(img,1,trasform_img_inv,0.5,0)
-    # plt.figure()
-    # plt.imshow(res[:, :, ::-1])
-    # plt.title("安全区域")
-    # plt.show()
-    lane_center = cal_line_center(img)
-    print("中心点位置：{}".format(lane_center))
 
 def process_image(img):
+    global latest_metadata
     # 图像去畸变
-    undistort_img = img_undistort(img,mtx,dist)
+    undistort_img = img_undistort(img, mtx, dist)
     # 车道线检测
     rigin_pipline_img = pipeline(undistort_img)
     # 透视变换
-    transform_img = img_perspect_transform(rigin_pipline_img,M)
-    # 拟合车道线
-    left_fit,right_fit = cal_line_param(transform_img)
+    transform_img = img_perspect_transform(rigin_pipline_img, M)
+    # 拟合车道线并识别类型
+    left_fit, right_fit, left_type, right_type = cal_line_param(transform_img)
     # 绘制安全区域
-    result = fill_lane_poly(transform_img,left_fit,right_fit)
-    transform_img_inv = img_perspect_transform(result,M_inverse)
+    result = fill_lane_poly(transform_img, left_fit, right_fit)
+    transform_img_inv = img_perspect_transform(result, M_inverse)
 
-    # 曲率和偏离距离
-    transform_img_inv = cal_radius(transform_img_inv,left_fit,right_fit)
-    transform_img_inv = cal_center_departure(transform_img_inv,left_fit,right_fit)
-    transform_img_inv = cv2.addWeighted(undistort_img,1,transform_img_inv,0.5,0)
+    # 曲率和偏离距离及类型显示
+    transform_img_inv, curvature = cal_radius(transform_img_inv, left_fit, right_fit)
+    transform_img_inv, departure = cal_center_departure(transform_img_inv, left_fit, right_fit, left_type, right_type)
+    
+    # 更新全局数据
+    latest_metadata = {
+        'left_type': left_type,
+        'right_type': right_type,
+        'curvature': curvature,
+        'departure': departure
+    }
+    
+    transform_img_inv = cv2.addWeighted(undistort_img, 1, transform_img_inv, 0.5, 0)
     return transform_img_inv
 
-# 视频处理
-clip1 = VideoFileClip("project_video.mp4")
-white_clip = clip1.fl_image(process_image)
-# white_clip.ipython_display()
-white_clip.write_videofile("output.mp4",audio=False)
+def gen_frames():
+    cap = cv2.VideoCapture("project_video.mp4")
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            # 视频播放结束，重新开始
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue
+        
+        # 处理图像 (OpenCV 默认 BGR，pipeline 期望 RGB)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        processed_frame_rgb = process_image(frame_rgb)
+        # 转回 BGR 用于编码
+        processed_frame = cv2.cvtColor(processed_frame_rgb, cv2.COLOR_RGB2BGR)
+        
+        ret, buffer = cv2.imencode('.jpg', processed_frame)
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/metadata')
+def get_metadata():
+    return jsonify(latest_metadata)
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# 初始化全局参数
+ret, mtx, dist, rvecs, tvecs = cal_calibrate_params(file_paths)
+# 透视变换参考点 (根据 straight_lines2.jpg 确定)
+points = [[601, 448], [683, 448], [230, 717], [1097, 717]]
+# 获取透视变换矩阵
+ref_img = cv2.imread('./test/straight_lines2.jpg')
+M, M_inverse = cal_perspective_params(ref_img, points)
+
+if __name__ == "__main__":
+    print("正在启动 Web 服务器，请访问 http://localhost:8888")
+    app.run(host='0.0.0.0', port=8888, debug=False, threaded=True)
+
